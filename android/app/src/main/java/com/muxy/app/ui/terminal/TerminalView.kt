@@ -9,14 +9,18 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.isImeVisible
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.material.icons.filled.Computer
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -74,7 +78,8 @@ fun TerminalView(
 
     val accessory = remember { AccessoryState() }
     var pane by remember { mutableStateOf<PaneSession?>(null) }
-    var keyboardVisible by remember { mutableStateOf(true) }
+    @OptIn(ExperimentalLayoutApi::class)
+    val keyboardVisible = WindowInsets.isImeVisible
     var canCopy by remember { mutableStateOf(false) }
     val surfaceRef = remember { Ref<TerminalSurfaceView>() }
 
@@ -101,18 +106,17 @@ fun TerminalView(
         p.applyTheme(t.fg, t.bg, t.palette)
     }
 
-    // Re-take ownership whenever pane appears or owner is not us.
-    LaunchedEffect(paneID, owner, myID) {
-        val p = pane ?: return@LaunchedEffect
-        if (myID == null) return@LaunchedEffect
-        if (owner == null || (owner is PaneOwner.Remote && owner.deviceID == myID)) {
-            // Already ours (or unknown — try once).
-            return@LaunchedEffect
-        }
-        // Owner is Mac or another remote — wait for explicit user take-over.
-    }
+    // Initial take-over happens inside PaneSession.start() exactly once when the
+    // pane is first opened. After that, if the Mac (or another remote) takes
+    // over, the TakeOverOverlay shows and the user explicitly clicks to reclaim.
+    // We deliberately do not auto-reclaim on owner changes — that would fight
+    // the Mac for control after silent reconnects.
 
-    Column(modifier.background(palette.background)) {
+    Column(
+        modifier
+            .background(palette.background)
+            .imePadding(),
+    ) {
         Box(Modifier.weight(1f).fillMaxWidth()) {
             // Surface
             AndroidView(
@@ -174,7 +178,6 @@ fun TerminalView(
             onToggleKeyboard = {
                 val v = surfaceRef.value ?: return@AccessoryBar
                 if (keyboardVisible) v.hideSoftKeyboard() else v.showSoftKeyboard()
-                keyboardVisible = !keyboardVisible
             },
         )
     }

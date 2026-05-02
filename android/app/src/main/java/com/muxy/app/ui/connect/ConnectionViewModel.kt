@@ -12,16 +12,21 @@ import com.muxy.app.data.SessionRepository
 import com.muxy.app.model.AuthenticateDeviceParams
 import com.muxy.app.model.PairDeviceParams
 import com.muxy.app.model.TaggedValue
+import com.muxy.app.model.MuxyMessage
 import com.muxy.app.model.authenticateDeviceRequest
 import com.muxy.app.model.decodePairingResult
+import com.muxy.app.model.listProjectsRequest
 import com.muxy.app.model.pairDeviceRequest
 import com.muxy.app.net.MuxyClient
+import com.muxy.app.net.TransportEvent
 import com.muxy.app.net.newRequestId
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.time.Duration.Companion.seconds
 
 sealed class ConnectionState {
@@ -46,6 +51,29 @@ class ConnectionViewModel(app: Application) : AndroidViewModel(app) {
 
     private val androidDeviceName: String = "${Build.MANUFACTURER} ${Build.MODEL}".trim()
     private var lastDevice: SavedDevice? = null
+
+    @Volatile private var isBackgrounded: Boolean = false
+    @Volatile private var isReconnecting: Boolean = false
+    private var transportJob: Job? = null
+
+    init {
+        // Observe socket-level events for the lifetime of the ViewModel. When the
+        // socket closes or fails while the user is "Connected", kick off a silent
+        // reconnect with backoff so the app self-heals instead of stranding the
+        // user on a stale screen.
+        transportJob = viewModelScope.launch {
+            client.events.collect { evt ->
+                when (evt) {
+                    is TransportEvent.Closed, is TransportEvent.Failure -> {
+                        if (_state.value is ConnectionState.Connected) {
+                            lastDevice?.let { reconnectSilently(it) }
+                        }
+                    }
+                    else -> Unit
+                }
+            }
+        }
+    }
 
     fun addDevice(name: String, host: String, port: Int) {
         val cleanName = name.ifBlank { "Mac" }
@@ -156,9 +184,110 @@ class ConnectionViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun fail(userMessage: String, technical: String) {
+        if (isBackgrounded) return
         client.disconnect()
         session.stopObserving()
         _state.value = ConnectionState.Error(userMessage, technical)
+    }
+
+    fun onForeground() {
+        isBackgrounded = false
+        val device = lastDevice ?: return
+        when (_state.value) {
+            is ConnectionState.Error -> connect(device)
+            is ConnectionState.Connected -> {
+                if (!client.isConnected) reconnectSilently(device)
+                else viewModelScope.launch { verifyOrReconnect(device) }
+            }
+            else -> Unit
+        }
+    }
+
+    fun onBackground() {
+        isBackgrounded = true
+    }
+
+    private suspend fun verifyOrReconnect(device: SavedDevice) {
+        // Lightweight liveness check: re-list projects with a short timeout.
+        // If it fails, the socket is dead even though OkHttp hasn't surfaced it yet.
+        val ok = runCatching {
+            withTimeoutOrNull(3.seconds) {
+                client.send(listProjectsLikePing(), 3.seconds)
+            } != null
+        }.getOrDefault(false)
+        if (!ok) reconnectSilently(device)
+    }
+
+    private fun listProjectsLikePing(): MuxyMessage.Request = listProjectsRequest(newRequestId())
+
+    private fun reconnectSilently(device: SavedDevice) {
+        if (isReconnecting) return
+        isReconnecting = true
+        viewModelScope.launch {
+            try {
+                // Drop stale ownership so the server's next paneOwnershipChanged
+                // event drives whether we show the TakeOverOverlay.
+                session.clearPaneOwners()
+                val activeProject = session.activeProjectID.value
+                val credentials = credentialsStore.load()
+
+                // Retry with capped exponential backoff: 1s, 2s, 4s, 8s, 8s, ...
+                var attempt = 0
+                while (true) {
+                    if (isBackgrounded) { delay(2.seconds); continue }
+                    val ok = tryAuthenticateOnce(device, credentials)
+                    if (ok) break
+                    attempt++
+                    val backoffMs = (1000L shl attempt.coerceAtMost(3)).coerceAtMost(8000L)
+                    delay(backoffMs)
+                }
+                session.startObserving()
+                session.refreshProjects()
+                // Refresh the active project's workspace WITHOUT calling
+                // selectProject — that would clear _workspace, which in turn
+                // tears down the visible TerminalView's PaneSession and would
+                // auto-takeover on recreate. We just want fresh state.
+                if (activeProject != null) session.refreshWorkspace(activeProject)
+            } finally {
+                isReconnecting = false
+            }
+        }
+    }
+
+    /**
+     * One reconnect attempt that never transitions to Error. Returns true on
+     * successful re-authentication, false on any transport / auth failure so
+     * the caller can back off and retry.
+     */
+    private suspend fun tryAuthenticateOnce(device: SavedDevice, credentials: DeviceCredentials): Boolean {
+        return try {
+            client.connect(device.host, device.port)
+            delay(500)
+            val resp = client.send(
+                authenticateDeviceRequest(
+                    newRequestId(),
+                    AuthenticateDeviceParams(
+                        deviceID = credentials.deviceID.toString(),
+                        deviceName = androidDeviceName,
+                        token = credentials.token,
+                    ),
+                ),
+                timeout = 10.seconds,
+            )
+            if (resp.error != null) return false
+            val pairing = decodePairingResult(resp.result) ?: return false
+            session.setMyClientID(pairing.clientID)
+            if (pairing.themeFg != null && pairing.themeBg != null) {
+                session.applyInitialTheme(pairing.themeFg, pairing.themeBg, pairing.themePalette ?: emptyList())
+            }
+            // Refresh the visible state's clientID without touching the screen.
+            (_state.value as? ConnectionState.Connected)?.let {
+                _state.value = ConnectionState.Connected(it.deviceName, pairing.clientID)
+            }
+            true
+        } catch (_: Throwable) {
+            false
+        }
     }
 
     override fun onCleared() {

@@ -41,6 +41,8 @@ class MuxyClient {
     private var socket: WebSocket? = null
     private val pending = ConcurrentHashMap<String, CompletableDeferred<MuxyResponse>>()
 
+    val isConnected: Boolean get() = socket != null
+
     private val _events = MutableSharedFlow<TransportEvent>(
         extraBufferCapacity = 64,
         onBufferOverflow = BufferOverflow.DROP_OLDEST,
@@ -107,12 +109,14 @@ class MuxyClient {
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
             Log.d(TAG, "WebSocket closed code=$code reason=$reason")
+            if (socket === webSocket) socket = null
             _events.tryEmit(TransportEvent.Closed(reason, code))
             failAllPending(IllegalStateException("WebSocket closed: $code $reason"))
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
             Log.w(TAG, "WebSocket failure", t)
+            if (socket === webSocket) socket = null
             _events.tryEmit(TransportEvent.Failure(t))
             failAllPending(t)
         }

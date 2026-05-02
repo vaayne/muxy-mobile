@@ -147,6 +147,9 @@ class SessionRepository(
 
     fun setMyClientID(id: String) { _myClientID.value = id }
 
+    /** Drop stale pane-ownership state so a reconnecting client will re-take its panes. */
+    fun clearPaneOwners() { _paneOwners.value = emptyMap() }
+
     suspend fun refreshProjects() {
         val resp = runCatching { client.send(listProjectsRequest(newRequestId()), 10.seconds) }
             .getOrElse { return setError("listProjects: ${it.message}") }

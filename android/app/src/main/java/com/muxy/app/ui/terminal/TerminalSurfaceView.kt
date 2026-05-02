@@ -213,6 +213,10 @@ class TerminalSurfaceView @JvmOverloads constructor(
     override fun onCheckIsTextEditor(): Boolean = true
 
     override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection {
+        // TYPE_NULL keeps hardware-keyboard key events flowing through onKeyDown
+        // with their modifier metadata intact (Ctrl/Alt/arrows). With a typed
+        // input class, Android can route printable keys through commitText()
+        // instead, stripping modifiers — which breaks Ctrl-C, Ctrl-D, etc.
         outAttrs.inputType = InputType.TYPE_NULL
         outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI or
             EditorInfo.IME_FLAG_NO_FULLSCREEN or
@@ -383,11 +387,13 @@ class TerminalSurfaceView @JvmOverloads constructor(
         return true
     }
 
-    private fun resolveColor(index: Int, palette: IntArray, fallback: Int): Int {
-        if (index < 0) return fallback
-        if (index >= 0 && index < palette.size) return palette[index]
-        // 24-bit truecolor: TextStyle stores high bit set with raw RGB.
-        return (0xFF shl 24) or (index and 0xFFFFFF)
+    private fun resolveColor(value: Int, palette: IntArray, fallback: Int): Int {
+        // TextStyle.decodeFore/BackColor returns either a small palette index
+        // (0..258) or a 24-bit truecolor with alpha=0xFF set. The truecolor form
+        // appears as a negative signed int (high bit set).
+        if (value and 0xFF000000.toInt() == 0xFF000000.toInt()) return value
+        if (value in 0 until palette.size) return palette[value]
+        return fallback
     }
 }
 
