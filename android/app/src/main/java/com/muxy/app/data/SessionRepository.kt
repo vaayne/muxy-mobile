@@ -2,8 +2,8 @@ package com.muxy.app.data
 
 import android.util.Log
 import com.muxy.app.model.CreateTabParams
-import com.muxy.app.model.DeviceThemeEventDTO
-import com.muxy.app.model.MuxyMessage
+import com.muxy.app.model.MuxyEventKind
+import com.muxy.app.model.NotificationDTO
 import com.muxy.app.model.ProjectDTO
 import com.muxy.app.model.ProjectLogoDTO
 import com.muxy.app.model.TabRefParams
@@ -17,13 +17,10 @@ import com.muxy.app.model.WorktreeDTO
 import com.muxy.app.model.closeTabRequest
 import com.muxy.app.model.createTabRequest
 import com.muxy.app.model.decodeBranches
-import com.muxy.app.model.decodeEventDeviceTheme
-import com.muxy.app.model.decodeEventPaneOwnership
-import com.muxy.app.model.decodeEventProjects
-import com.muxy.app.model.decodeEventWorkspace
 import com.muxy.app.model.PaneOwner
 import com.muxy.app.model.decodeProjectLogo
 import com.muxy.app.model.decodeProjects
+import com.muxy.app.model.toKind
 import com.muxy.app.model.decodeWorkspace
 import com.muxy.app.model.decodeWorktrees
 import com.muxy.app.model.getProjectLogoRequest
@@ -97,6 +94,9 @@ class SessionRepository(
     private val _lastError = MutableStateFlow<String?>(null)
     val lastError: StateFlow<String?> = _lastError.asStateFlow()
 
+    private val _notifications = MutableStateFlow<List<NotificationDTO>>(emptyList())
+    val notifications: StateFlow<List<NotificationDTO>> = _notifications.asStateFlow()
+
     fun paneIsOwnedBySelf(paneID: String): Boolean {
         val mine = _myClientID.value ?: return false
         val owner = _paneOwners.value[paneID] as? PaneOwner.Remote ?: return false
@@ -128,20 +128,46 @@ class SessionRepository(
         _workspace.value = null
         _paneOwners.value = emptyMap()
         _myClientID.value = null
+        _notifications.value = emptyList()
+    }
+
+    fun markNotificationRead(id: String) {
+        _notifications.value = _notifications.value.map {
+            if (it.id == id) it.copy(isRead = true) else it
+        }
     }
 
     private fun handleEvent(event: com.muxy.app.model.MuxyEvent) {
-        when (event.event) {
-            "projectsChanged" -> decodeEventProjects(event.data)?.let { _projects.value = it }
-            "workspaceChanged" -> decodeEventWorkspace(event.data)?.let { _workspace.value = it }
-            "themeChanged" -> decodeEventDeviceTheme(event.data)?.let {
-                _deviceTheme.value = DeviceTheme(it.fg, it.bg, it.palette ?: emptyList())
+        // Routed through the sealed MuxyEventKind so adding a new server event
+        // forces a compile-time decision here rather than silently dropping.
+        // PaneSession owns terminalOutput/Snapshot — they are intentional no-ops
+        // at the repo level.
+        when (val kind = event.toKind()) {
+            is MuxyEventKind.ProjectsChanged -> _projects.value = kind.projects
+            is MuxyEventKind.WorkspaceChanged -> _workspace.value = kind.workspace
+            is MuxyEventKind.ThemeChanged -> {
+                val t = kind.theme
+                _deviceTheme.value = DeviceTheme(t.fg, t.bg, t.palette ?: emptyList())
             }
-            "paneOwnershipChanged" -> {
-                val dto = decodeEventPaneOwnership(event.data) ?: return
-                val owner = PaneOwner.fromJson(dto.owner) ?: return
+            is MuxyEventKind.PaneOwnershipChanged -> {
+                val dto = kind.ownership
+                val owner = PaneOwner.fromJson(dto.owner) ?: run {
+                    Log.w(TAG, "paneOwnershipChanged: failed to parse owner=${dto.owner}")
+                    return
+                }
                 _paneOwners.value = _paneOwners.value + (dto.paneID to owner)
             }
+            is MuxyEventKind.TabChanged -> {
+                // Mac authoritatively pushes a workspaceChanged after tab edits,
+                // so the tab event itself doesn't need state mutation. iOS also
+                // no-ops on .tab (ConnectionManager.swift handleEvent).
+            }
+            is MuxyEventKind.NotificationReceived -> {
+                _notifications.value = listOf(kind.notification) + _notifications.value
+            }
+            is MuxyEventKind.TerminalOutput,
+            is MuxyEventKind.TerminalSnapshot -> Unit // routed by PaneSession
+            is MuxyEventKind.Unknown -> Unit // already logged in toKind()
         }
     }
 
@@ -272,7 +298,13 @@ class SessionRepository(
     /** Get-or-create the pane session for a given paneID. */
     fun openPane(paneID: String, cols: Int, rows: Int): PaneSession {
         panes[paneID]?.let { return it }
-        val pane = PaneSession(paneID, cols, rows, client, scope)
+        val pane = PaneSession(
+            paneID = paneID,
+            initialCols = cols,
+            initialRows = rows,
+            client = client,
+            scope = scope,
+        )
         panes[paneID] = pane
         _deviceTheme.value?.let { t -> pane.applyTheme(t.fg, t.bg, t.palette) }
         pane.start()

@@ -83,6 +83,15 @@ fun TerminalView(
     var canCopy by remember { mutableStateOf(false) }
     val surfaceRef = remember { Ref<TerminalSurfaceView>() }
 
+    // Mirrors iOS's `reportedCols` / `reportedRows`: surface fills these in
+    // once it has actually laid out, and we use them to drive takeOverPane.
+    var measuredCols by remember(paneID) { mutableStateOf<Int?>(null) }
+    var measuredRows by remember(paneID) { mutableStateOf<Int?>(null) }
+    // Mirrors iOS's `autoTakenPaneID`: ensures the auto-takeover fires exactly
+    // once per (re)appearance for a given paneID. After that, the user must
+    // tap Take Over manually — we don't fight the Mac on every owner change.
+    var autoTakenPaneID by remember { mutableStateOf<String?>(null) }
+
     val owner = owners[paneID]
     val isOwnedBySelf = remember(owner, myID) {
         val mine = myID
@@ -91,11 +100,18 @@ fun TerminalView(
 
     // Pane lifecycle: open on enter, release on leave/paneID change.
     DisposableEffect(paneID) {
-        val opened = session.openPane(paneID, 80, 24)
+        // Use a 2x2 sentinel so the emulator can be constructed, but the real
+        // takeOverPane is deferred until `measuredCols`/`measuredRows` arrive
+        // from the surface. iOS does the same — `attemptAutoTakeOver` no-ops
+        // until `reportedCols` is set.
+        val opened = session.openPane(paneID, 2, 2)
         pane = opened
+        autoTakenPaneID = null
         onDispose {
             session.closePane(paneID)
             pane = null
+            measuredCols = null
+            measuredRows = null
         }
     }
 
@@ -106,11 +122,18 @@ fun TerminalView(
         p.applyTheme(t.fg, t.bg, t.palette)
     }
 
-    // Initial take-over happens inside PaneSession.start() exactly once when the
-    // pane is first opened. After that, if the Mac (or another remote) takes
-    // over, the TakeOverOverlay shows and the user explicitly clicks to reclaim.
-    // We deliberately do not auto-reclaim on owner changes — that would fight
-    // the Mac for control after silent reconnects.
+    // First measurement → first takeOverPane. Mirrors iOS's
+    // `attemptAutoTakeOver(reportedCols, reportedRows)`:
+    //   - cols/rows must be known
+    //   - guard against firing twice for the same paneID
+    LaunchedEffect(paneID, pane, measuredCols, measuredRows) {
+        val p = pane ?: return@LaunchedEffect
+        val c = measuredCols ?: return@LaunchedEffect
+        val r = measuredRows ?: return@LaunchedEffect
+        if (autoTakenPaneID == paneID) return@LaunchedEffect
+        autoTakenPaneID = paneID
+        p.takeOver(c, r)
+    }
 
     Column(
         modifier
@@ -127,6 +150,10 @@ fun TerminalView(
                         fontSizePx = fontPx
                         modifierProvider = { accessory.consume() }
                         onSelectionChanged = { canCopy = it }
+                        onMeasured = { c, r ->
+                            measuredCols = c
+                            measuredRows = r
+                        }
                         surfaceRef.value = this
                     }
                 },
@@ -154,7 +181,9 @@ fun TerminalView(
                     background = palette.background,
                     onTakeOver = {
                         val p = pane ?: return@TakeOverOverlay
-                        scope.launch { p.takeOver() }
+                        val c = measuredCols ?: return@TakeOverOverlay
+                        val r = measuredRows ?: return@TakeOverOverlay
+                        scope.launch { p.takeOver(c, r) }
                     },
                 )
             }

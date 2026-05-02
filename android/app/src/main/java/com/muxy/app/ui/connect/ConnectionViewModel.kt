@@ -26,6 +26,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.time.Duration.Companion.seconds
 
@@ -53,6 +55,17 @@ class ConnectionViewModel(app: Application) : AndroidViewModel(app) {
     private var lastDevice: SavedDevice? = null
 
     @Volatile private var isBackgrounded: Boolean = false
+
+    /**
+     * Single coordinator for all connect / reconnect / verify operations.
+     * Without this, three independent entry points (transport-event-driven
+     * silent reconnect, foreground verify, manual reconnect) can fire
+     * concurrently — racing to authenticate on the same socket and producing
+     * duplicate auth attempts, churned pane state, or a stuck Connecting
+     * screen. Funnel everything through `connectionMutex.withLock` and the
+     * race disappears.
+     */
+    private val connectionMutex = Mutex()
     @Volatile private var isReconnecting: Boolean = false
     private var transportJob: Job? = null
 
@@ -91,7 +104,9 @@ class ConnectionViewModel(app: Application) : AndroidViewModel(app) {
 
     fun connect(device: SavedDevice) {
         lastDevice = device
-        viewModelScope.launch { runConnection(device) }
+        viewModelScope.launch {
+            connectionMutex.withLock { runConnection(device) }
+        }
     }
 
     fun reconnect() {
@@ -99,8 +114,12 @@ class ConnectionViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun disconnect() {
-        client.disconnect()
+        // Order matters: stop pane sessions (which fire releasePane) before
+        // closing the socket, otherwise those releases race the close and
+        // either dispatch on a dead socket or leave the Mac thinking we still
+        // own the panes. stopObserving() also clears local pane state.
         session.stopObserving()
+        client.disconnect()
         _state.value = ConnectionState.Disconnected
     }
 
@@ -185,19 +204,24 @@ class ConnectionViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun fail(userMessage: String, technical: String) {
         if (isBackgrounded) return
-        client.disconnect()
         session.stopObserving()
+        client.disconnect()
         _state.value = ConnectionState.Error(userMessage, technical)
     }
 
     fun onForeground() {
         isBackgrounded = false
         val device = lastDevice ?: return
+        // If a reconnect is already in flight (transport-event-driven), do not
+        // pile on a second one. The in-flight reconnect will settle the state.
+        if (isReconnecting) return
         when (_state.value) {
             is ConnectionState.Error -> connect(device)
             is ConnectionState.Connected -> {
                 if (!client.isConnected) reconnectSilently(device)
-                else viewModelScope.launch { verifyOrReconnect(device) }
+                else viewModelScope.launch {
+                    connectionMutex.withLock { verifyOrReconnect(device) }
+                }
             }
             else -> Unit
         }
@@ -215,43 +239,54 @@ class ConnectionViewModel(app: Application) : AndroidViewModel(app) {
                 client.send(listProjectsLikePing(), 3.seconds)
             } != null
         }.getOrDefault(false)
-        if (!ok) reconnectSilently(device)
+        if (!ok) reconnectSilentlyLocked(device)
     }
 
     private fun listProjectsLikePing(): MuxyMessage.Request = listProjectsRequest(newRequestId())
 
+    /**
+     * Public entry: launches a coroutine that takes the connection mutex and
+     * runs the reconnect loop. Serialized against connect() and verify() so
+     * rapid foreground/background or transport-failure storms can't fire
+     * overlapping authenticateDevice requests.
+     */
     private fun reconnectSilently(device: SavedDevice) {
         if (isReconnecting) return
         isReconnecting = true
         viewModelScope.launch {
             try {
-                // Drop stale ownership so the server's next paneOwnershipChanged
-                // event drives whether we show the TakeOverOverlay.
-                session.clearPaneOwners()
-                val activeProject = session.activeProjectID.value
-                val credentials = credentialsStore.load()
-
-                // Retry with capped exponential backoff: 1s, 2s, 4s, 8s, 8s, ...
-                var attempt = 0
-                while (true) {
-                    if (isBackgrounded) { delay(2.seconds); continue }
-                    val ok = tryAuthenticateOnce(device, credentials)
-                    if (ok) break
-                    attempt++
-                    val backoffMs = (1000L shl attempt.coerceAtMost(3)).coerceAtMost(8000L)
-                    delay(backoffMs)
-                }
-                session.startObserving()
-                session.refreshProjects()
-                // Refresh the active project's workspace WITHOUT calling
-                // selectProject — that would clear _workspace, which in turn
-                // tears down the visible TerminalView's PaneSession and would
-                // auto-takeover on recreate. We just want fresh state.
-                if (activeProject != null) session.refreshWorkspace(activeProject)
+                connectionMutex.withLock { reconnectSilentlyLocked(device) }
             } finally {
                 isReconnecting = false
             }
         }
+    }
+
+    /** Must be invoked while holding [connectionMutex]. */
+    private suspend fun reconnectSilentlyLocked(device: SavedDevice) {
+        // Drop stale ownership so the server's next paneOwnershipChanged
+        // event drives whether we show the TakeOverOverlay.
+        session.clearPaneOwners()
+        val activeProject = session.activeProjectID.value
+        val credentials = credentialsStore.load()
+
+        // Retry with capped exponential backoff: 1s, 2s, 4s, 8s, 8s, ...
+        var attempt = 0
+        while (true) {
+            if (isBackgrounded) { delay(2.seconds); continue }
+            val ok = tryAuthenticateOnce(device, credentials)
+            if (ok) break
+            attempt++
+            val backoffMs = (1000L shl attempt.coerceAtMost(3)).coerceAtMost(8000L)
+            delay(backoffMs)
+        }
+        session.startObserving()
+        session.refreshProjects()
+        // Refresh the active project's workspace WITHOUT calling
+        // selectProject — that would clear _workspace, which in turn
+        // tears down the visible TerminalView's PaneSession and would
+        // auto-takeover on recreate. We just want fresh state.
+        if (activeProject != null) session.refreshWorkspace(activeProject)
     }
 
     /**
@@ -291,8 +326,9 @@ class ConnectionViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     override fun onCleared() {
-        client.disconnect()
+        // Same ordering as disconnect(): stop panes (release) before close.
         session.stopObserving()
+        client.disconnect()
         super.onCleared()
     }
 }

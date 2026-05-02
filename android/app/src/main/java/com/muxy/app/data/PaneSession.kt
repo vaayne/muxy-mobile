@@ -2,15 +2,21 @@ package com.muxy.app.data
 
 import android.util.Base64
 import com.muxy.app.model.MuxyEvent
+import com.muxy.app.model.MuxyEventKind
 import com.muxy.app.model.ReleasePaneParams
 import com.muxy.app.model.TakeOverPaneParams
+import com.muxy.app.model.TerminalContentDTO
 import com.muxy.app.model.TerminalInputParams
 import com.muxy.app.model.TerminalResizeParams
-import com.muxy.app.model.decodeTerminalOutput
+import com.muxy.app.model.TerminalScrollParams
+import com.muxy.app.model.decodeTerminalContent
+import com.muxy.app.model.getTerminalContentRequest
 import com.muxy.app.model.releasePaneRequest
 import com.muxy.app.model.takeOverPaneRequest
 import com.muxy.app.model.terminalInputRequest
 import com.muxy.app.model.terminalResizeRequest
+import com.muxy.app.model.terminalScrollRequest
+import com.muxy.app.model.toKind
 import com.muxy.app.net.MuxyClient
 import com.muxy.app.net.TransportEvent
 import com.muxy.app.net.newRequestId
@@ -72,17 +78,34 @@ class PaneSession(
 
     private var eventJob: Job? = null
 
-    /** Re-send takeOverPane with the current size (e.g. after the user taps "Take Over"). */
-    suspend fun takeOver() {
+    /**
+     * Send `takeOverPane` with the given size. Mirrors iOS's
+     * `attemptAutoTakeOver` and `takeOverCurrentPane` — both call sites pass
+     * the surface's measured cols/rows so the Mac sizes the PTY correctly on
+     * the very first frame instead of starting at a stale 80x24 and reflowing.
+     *
+     * Also updates this PaneSession's cached cols/rows so subsequent resize()
+     * calls compare against the right baseline.
+     */
+    suspend fun takeOver(takeoverCols: Int = cols, takeoverRows: Int = rows) {
+        val c = takeoverCols.coerceAtLeast(2)
+        val r = takeoverRows.coerceAtLeast(2)
+        cols = c
+        rows = r
         runCatching {
             client.send(
-                takeOverPaneRequest(newRequestId(), TakeOverPaneParams(paneID, cols, rows)),
+                takeOverPaneRequest(newRequestId(), TakeOverPaneParams(paneID, c, r)),
                 10.seconds,
             )
         }
     }
 
-    /** Send `takeOverPane` and start consuming terminalOutput / terminalSnapshot events. */
+    /**
+     * Start consuming terminalOutput / terminalSnapshot events. Does NOT send
+     * `takeOverPane` — the caller (TerminalView) drives takeover once the
+     * surface has measured its real cols/rows, mirroring iOS's
+     * `attemptAutoTakeOver` flow gated on `reportedCols`/`reportedRows`.
+     */
     fun start() {
         eventJob?.cancel()
         eventJob = scope.launch {
@@ -91,14 +114,6 @@ class PaneSession(
                     is TransportEvent.EventReceived -> handle(evt.event)
                     else -> Unit
                 }
-            }
-        }
-        scope.launch {
-            runCatching {
-                client.send(
-                    takeOverPaneRequest(newRequestId(), TakeOverPaneParams(paneID, cols, rows)),
-                    10.seconds,
-                )
             }
         }
     }
@@ -132,6 +147,27 @@ class PaneSession(
         bumpTick()
     }
 
+    /** Forward a scroll gesture to the server (mirrors Swift's terminalScroll). */
+    fun scroll(deltaX: Double, deltaY: Double, precise: Boolean) {
+        scope.launch {
+            runCatching {
+                client.send(
+                    terminalScrollRequest(
+                        newRequestId(),
+                        TerminalScrollParams(paneID, deltaX, deltaY, precise),
+                    ),
+                    5.seconds,
+                )
+            }
+        }
+    }
+
+    /** Refetch the full PTY-bytes snapshot (e.g. after reconnect, to restore scrollback). */
+    suspend fun getContent(): TerminalContentDTO? = runCatching {
+        val resp = client.send(getTerminalContentRequest(newRequestId(), paneID), 10.seconds)
+        decodeTerminalContent(resp.result)
+    }.getOrNull()
+
     /** Forward keystrokes (already encoded into PTY bytes) to the server. */
     fun sendBytes(bytes: ByteArray) = sendBytes(bytes, 0, bytes.size)
 
@@ -143,8 +179,11 @@ class PaneSession(
     }
 
     private fun handle(event: MuxyEvent) {
-        if (event.event != "terminalOutput" && event.event != "terminalSnapshot") return
-        val out = decodeTerminalOutput(event.data) ?: return
+        val out = when (val kind = event.toKind()) {
+            is MuxyEventKind.TerminalOutput -> kind.output
+            is MuxyEventKind.TerminalSnapshot -> kind.output
+            else -> return
+        }
         if (out.paneID != paneID) return
         val bytes = runCatching { Base64.decode(out.bytes, Base64.DEFAULT) }.getOrNull() ?: return
         synchronized(emulator) {

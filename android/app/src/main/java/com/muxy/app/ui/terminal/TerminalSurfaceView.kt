@@ -90,6 +90,15 @@ class TerminalSurfaceView @JvmOverloads constructor(
     /** Listener notified when the user makes/clears a selection. */
     var onSelectionChanged: (Boolean) -> Unit = {}
 
+    /**
+     * Listener notified when the surface measures itself (or re-measures on
+     * size change) with the resulting integer cols/rows. Mirrors iOS's
+     * `SwiftTermRepresentable` size-reported callback so callers can defer
+     * `takeOverPane` until the real grid is known instead of sending a stale
+     * 80x24 default.
+     */
+    var onMeasured: (cols: Int, rows: Int) -> Unit = { _, _ -> }
+
     fun selectedText(): String? {
         if (!hasSelection) return null
         val em = pane?.emulator ?: return null
@@ -194,6 +203,11 @@ class TerminalSurfaceView @JvmOverloads constructor(
             cols = newCols
             rows = newRows
             pane?.resize(newCols, newRows)
+            onMeasured(newCols, newRows)
+        } else if (oldw == 0 && oldh == 0) {
+            // First layout pass at the default cols/rows — still need to tell
+            // the caller so it can fire the initial takeOverPane.
+            onMeasured(newCols, newRows)
         }
     }
 
