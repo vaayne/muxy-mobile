@@ -122,6 +122,7 @@ jobs:
           releaseFiles: android/app/build/outputs/bundle/release/*.aab
           track: ${{ steps.validate.outputs.track }}
           status: draft
+          changesNotSentForReview: true
 
       - name: Create GitHub Release
         working-directory: .
