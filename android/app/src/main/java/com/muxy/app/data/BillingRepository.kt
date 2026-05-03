@@ -2,6 +2,7 @@ package com.muxy.app.data
 
 import android.app.Activity
 import android.content.Context
+import android.util.Log
 import com.android.billingclient.api.AcknowledgePurchaseParams
 import com.android.billingclient.api.BillingClient
 import com.android.billingclient.api.BillingClientStateListener
@@ -22,6 +23,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.coroutines.resume
@@ -44,11 +46,10 @@ class BillingRepository(
 
     private val _purchased = MutableStateFlow(false)
     private val _trialStartedAt = MutableStateFlow(trialStore.startedAt())
-    private val _tick = MutableStateFlow(0L)
     private val _productDetails = MutableStateFlow<ProductDetails?>(null)
     val productDetails: StateFlow<ProductDetails?> = _productDetails.asStateFlow()
 
-    val entitlement: StateFlow<Entitlement> = combine(_purchased, _trialStartedAt, _tick) { bought, started, _ ->
+    val entitlement: StateFlow<Entitlement> = combine(_purchased, _trialStartedAt) { bought, started ->
         compute(bought, started)
     }.stateIn(scope, SharingStarted.Eagerly, Entitlement.Loading)
 
@@ -78,23 +79,39 @@ class BillingRepository(
         _trialStartedAt.value = started
     }
 
-    fun refreshTick() {
-        _tick.value = now()
-    }
+    @Volatile private var retryAttempt: Int = 0
 
     private fun startBillingConnection() {
         val client = billingClient ?: return
+        Log.i(TAG, "Connecting to Play Billing...")
         client.startConnection(object : BillingClientStateListener {
             override fun onBillingSetupFinished(result: BillingResult) {
+                Log.i(TAG, "onBillingSetupFinished: code=${result.responseCode} msg=${result.debugMessage}")
                 if (result.responseCode == BillingClient.BillingResponseCode.OK) {
+                    retryAttempt = 0
                     scope.launch {
                         queryPurchases()
                         queryProduct()
                     }
+                } else {
+                    scheduleReconnect()
                 }
             }
-            override fun onBillingServiceDisconnected() = Unit
+            override fun onBillingServiceDisconnected() {
+                Log.w(TAG, "Billing service disconnected; scheduling reconnect")
+                scheduleReconnect()
+            }
         })
+    }
+
+    private fun scheduleReconnect() {
+        val attempt = retryAttempt.coerceAtMost(5)
+        retryAttempt = attempt + 1
+        val backoffMs = (1_000L shl attempt).coerceAtMost(30_000L)
+        scope.launch {
+            delay(backoffMs)
+            startBillingConnection()
+        }
     }
 
     private suspend fun queryPurchases() {
@@ -102,9 +119,10 @@ class BillingRepository(
         val params = QueryPurchasesParams.newBuilder()
             .setProductType(BillingClient.ProductType.INAPP)
             .build()
-        val purchases = suspendCancellableCoroutine { cont ->
-            client.queryPurchasesAsync(params) { _, list -> cont.resume(list) }
+        val (result, purchases) = suspendCancellableCoroutine { cont ->
+            client.queryPurchasesAsync(params) { r, l -> cont.resume(r to l) }
         }
+        Log.i(TAG, "queryPurchasesAsync: code=${result.responseCode} msg=${result.debugMessage} count=${purchases.size}")
         handlePurchases(purchases)
     }
 
@@ -118,10 +136,11 @@ class BillingRepository(
                     .build(),
             ),
         ).build()
-        val details = suspendCancellableCoroutine { cont ->
-            client.queryProductDetailsAsync(params) { _, list -> cont.resume(list) }
+        val (result, list) = suspendCancellableCoroutine { cont ->
+            client.queryProductDetailsAsync(params) { r, l -> cont.resume(r to l) }
         }
-        _productDetails.value = details.firstOrNull { it.productId == PRODUCT_ID }
+        Log.i(TAG, "queryProductDetailsAsync: code=${result.responseCode} msg=${result.debugMessage} count=${list.size} ids=${list.map { it.productId }}")
+        _productDetails.value = list.firstOrNull { it.productId == PRODUCT_ID }
     }
 
     private fun handlePurchases(purchases: List<Purchase>) {
@@ -160,5 +179,6 @@ class BillingRepository(
 
     companion object {
         const val PRODUCT_ID = "muxy_unlock"
+        private const val TAG = "MuxyBilling"
     }
 }

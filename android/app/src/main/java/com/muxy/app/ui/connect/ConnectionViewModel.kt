@@ -100,7 +100,6 @@ class ConnectionViewModel(app: Application) : AndroidViewModel(app) {
 
     fun connect(device: SavedDevice) {
         lastDevice = device
-        billing.refreshTick()
         if (billing.entitlement.value is Entitlement.Expired) {
             _state.value = ConnectionState.Paywall
             return
@@ -246,7 +245,6 @@ class ConnectionViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun reconnectSilently(device: SavedDevice) {
         if (isReconnecting) return
-        billing.refreshTick()
         if (billing.entitlement.value is Entitlement.Expired) {
             _state.value = ConnectionState.Paywall
             return
