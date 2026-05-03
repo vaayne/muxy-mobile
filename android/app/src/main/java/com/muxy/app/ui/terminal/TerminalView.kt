@@ -1,18 +1,19 @@
 package com.muxy.app.ui.terminal
 
+import android.content.Context
 import android.graphics.Typeface
+import android.view.View
+import android.view.inputmethod.InputMethodManager
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.isImeVisible
 import androidx.compose.foundation.layout.padding
@@ -20,16 +21,15 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.material.icons.filled.Computer
 import androidx.compose.material3.Icon
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -39,7 +39,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -48,15 +47,22 @@ import com.muxy.app.data.PaneSession
 import com.muxy.app.data.SessionRepository
 import com.muxy.app.model.PaneOwner
 import com.muxy.app.ui.theme.MuxyTheme
+import com.termux.terminal.TerminalEmulator
+import com.termux.terminal.TextStyle
+import com.termux.view.TerminalView as TermuxTerminalView
 import kotlinx.coroutines.launch
 
 private const val FONT_PATH = "fonts/JetBrainsMonoNerdFontMono-Regular.ttf"
-private const val FONT_PATH_BOLD = "fonts/JetBrainsMonoNerdFontMono-Bold.ttf"
+private const val FONT_SIZE_SP = 13
 
 /**
- * Top-level terminal pane. Owns the AndroidView that renders the emulator and
- * captures IME/hardware input. Shows a take-over overlay when another client
- * (Mac or another remote) currently owns this pane.
+ * Top-level terminal pane. Hosts the vendored termux [TermuxTerminalView] which
+ * provides the smooth fling/pinch/scroll/IME machinery, and feeds it bytes from
+ * [PaneSession] via a dedicated [MuxyTerminalSession] adapter.
+ *
+ * The Compose-side `PaneSession` still owns the take-over / release / resize
+ * RPCs; we just bypass its internal emulator (via [PaneSession.byteSink]) so
+ * the termux view's own emulator does the rendering.
  */
 @Composable
 fun TerminalView(
@@ -69,28 +75,37 @@ fun TerminalView(
     val owners by session.paneOwners.collectAsState()
     val myID by session.myClientID.collectAsState()
     val context = LocalContext.current
-    val density = LocalDensity.current
     val scope = rememberCoroutineScope()
 
-    val regular = remember { Typeface.createFromAsset(context.assets, FONT_PATH) }
-    val bold = remember { Typeface.createFromAsset(context.assets, FONT_PATH_BOLD) }
-    val fontPx = with(density) { 13.sp.toPx() }
+    val typeface = remember { resolveTypeface(context) }
 
+    var pane by remember(paneID) { mutableStateOf<PaneSession?>(null) }
+    val sessionClient = remember { MuxyTerminalSessionClient(context) }
+    val viewClient = remember { MuxyTerminalViewClient() }
     val accessory = remember { AccessoryState() }
-    var pane by remember { mutableStateOf<PaneSession?>(null) }
+    val termSession = remember(paneID) { mutableStateOf<MuxyTerminalSession?>(null) }
+    val termViewRef = remember(paneID) { mutableStateOf<TermuxTerminalView?>(null) }
+    sessionClient.onTextChanged = {
+        // Termux's notifyScreenUpdate only forwards a callback; it does not
+        // schedule a draw. Without this, bytes appended after takeover are
+        // visible only after the next user gesture forces invalidate().
+        termViewRef.value?.let { v -> v.post { v.invalidate() } }
+    }
+    val sizeReporter = remember(paneID) { SizeReporter() }
+
     @OptIn(ExperimentalLayoutApi::class)
     val keyboardVisible = WindowInsets.isImeVisible
-    var canCopy by remember { mutableStateOf(false) }
-    val surfaceRef = remember { Ref<TerminalSurfaceView>() }
 
-    // Mirrors iOS's `reportedCols` / `reportedRows`: surface fills these in
-    // once it has actually laid out, and we use them to drive takeOverPane.
     var measuredCols by remember(paneID) { mutableStateOf<Int?>(null) }
     var measuredRows by remember(paneID) { mutableStateOf<Int?>(null) }
-    // Mirrors iOS's `autoTakenPaneID`: ensures the auto-takeover fires exactly
-    // once per (re)appearance for a given paneID. After that, the user must
-    // tap Take Over manually — we don't fight the Mac on every owner change.
     var autoTakenPaneID by remember { mutableStateOf<String?>(null) }
+    // Consumed at mount: true only when the user just opened a project or
+    // switched tabs. Bypasses the Mac-owns-it guard for a silent takeover.
+    val userInitiatedMount = remember(paneID) { session.consumeAutoTakeover() }
+    // Tracks whether the silent-takeover handshake has completed (we became
+    // the confirmed owner at least once). After that, normal overlay rules
+    // apply — including showing the overlay when the Mac steals back.
+    var ownershipConfirmedOnce by remember(paneID) { mutableStateOf(false) }
 
     val owner = owners[paneID]
     val isOwnedBySelf = remember(owner, myID) {
@@ -98,39 +113,56 @@ fun TerminalView(
         owner is PaneOwner.Remote && mine != null && owner.deviceID == mine
     }
 
-    // Pane lifecycle: open on enter, release on leave/paneID change.
+    viewClient.modifierProvider = { accessory.consume() }
+    sessionClient.onPasteRequested = {
+        pasteFromClipboardText(context)?.let { text ->
+            termSession.value?.write(text.toByteArray(Charsets.UTF_8), 0, text.toByteArray(Charsets.UTF_8).size)
+        }
+    }
+
     DisposableEffect(paneID) {
-        // Use a 2x2 sentinel so the emulator can be constructed, but the real
-        // takeOverPane is deferred until `measuredCols`/`measuredRows` arrive
-        // from the surface. iOS does the same — `attemptAutoTakeOver` no-ops
-        // until `reportedCols` is set.
+        // 2x2 sentinel so PaneSession can construct; the real takeOverPane is
+        // deferred until the termux view reports its measured cols/rows.
         val opened = session.openPane(paneID, 2, 2)
+        val ts = MuxyTerminalSession(opened, sessionClient)
+        opened.byteSink = { bytes -> ts.acceptRemoteOutput(bytes) }
         pane = opened
+        termSession.value = ts
         autoTakenPaneID = null
         onDispose {
+            opened.byteSink = null
+            ts.finishIfRunning()
             session.closePane(paneID)
             pane = null
+            termSession.value = null
             measuredCols = null
             measuredRows = null
         }
     }
 
-    // Re-apply theme to the emulator when it changes mid-session.
-    LaunchedEffect(theme, pane) {
-        val p = pane ?: return@LaunchedEffect
-        val t = theme ?: return@LaunchedEffect
-        p.applyTheme(t.fg, t.bg, t.palette)
+    LaunchedEffect(theme, termSession.value) {
+        val view = termViewRef.value ?: return@LaunchedEffect
+        applyTheme(view, theme?.fg, theme?.bg, theme?.palette)
     }
 
-    // First measurement → first takeOverPane. Mirrors iOS's
-    // `attemptAutoTakeOver(reportedCols, reportedRows)`:
-    //   - cols/rows must be known
-    //   - guard against firing twice for the same paneID
+    LaunchedEffect(isOwnedBySelf) {
+        if (isOwnedBySelf) ownershipConfirmedOnce = true
+    }
+
     LaunchedEffect(paneID, pane, measuredCols, measuredRows) {
         val p = pane ?: return@LaunchedEffect
         val c = measuredCols ?: return@LaunchedEffect
         val r = measuredRows ?: return@LaunchedEffect
         if (autoTakenPaneID == paneID) return@LaunchedEffect
+        // Auto-takeover policy:
+        //  - If the user just opened a project or switched tabs, takeover
+        //    silently regardless of current owner (userInitiatedMount).
+        //  - Otherwise, never auto-takeover from the Mac — the user must tap
+        //    "Take Over" in the overlay.
+        if (!userInitiatedMount && owner is PaneOwner.Mac) {
+            autoTakenPaneID = paneID // suppress further attempts for this mount
+            return@LaunchedEffect
+        }
         autoTakenPaneID = paneID
         p.takeOver(c, r)
     }
@@ -141,49 +173,67 @@ fun TerminalView(
             .imePadding(),
     ) {
         Box(Modifier.weight(1f).fillMaxWidth()) {
-            // Surface
-            AndroidView(
-                factory = { ctx ->
-                    TerminalSurfaceView(ctx).apply {
-                        typefaceRegular = regular
-                        typefaceBold = bold
-                        fontSizePx = fontPx
-                        modifierProvider = { accessory.consume() }
-                        onSelectionChanged = { canCopy = it }
-                        onMeasured = { c, r ->
+            // key(paneID): force a fresh AndroidView per tab so the termux
+            // TerminalView is bound to exactly one MuxyTerminalSession for its
+            // lifetime. Reusing the same View across tab switches leaves the
+            // old session's emulator visible and breaks size reporting.
+            key(paneID) {
+                AndroidView(
+                    modifier = Modifier.fillMaxSize(),
+                    factory = { ctx ->
+                        TermuxTerminalView(ctx, null).apply {
+                            setTerminalViewClient(viewClient)
+                            setTextSize(spToPx(ctx, FONT_SIZE_SP).toInt())
+                            setTypeface(typeface)
+                            termSession.value?.let { attachSession(it) }
+                            applyTheme(this, theme?.fg, theme?.bg, theme?.palette)
+                            sizeReporter.attach(this) { c, r ->
+                                measuredCols = c
+                                measuredRows = r
+                                pane?.resize(c, r)
+                            }
+                            termViewRef.value = this
+                        }
+                    },
+                    update = { view ->
+                        termSession.value?.let { view.attachSession(it) }
+                        applyTheme(view, theme?.fg, theme?.bg, theme?.palette)
+                        sizeReporter.attach(view) { c, r ->
                             measuredCols = c
                             measuredRows = r
+                            pane?.resize(c, r)
                         }
-                        surfaceRef.value = this
-                    }
-                },
-                update = { v ->
-                    v.pane = pane
-                    v.invalidate()
-                },
-                modifier = Modifier.fillMaxSize(),
-            )
-
-            // Redraw whenever the emulator buffer changes.
-            val tickFlow = pane?.tick
-            val tick by (tickFlow?.collectAsState() ?: remember { mutableStateOf(0L) })
-            LaunchedEffect(tick) { surfaceRef.value?.invalidate() }
-
-            // Auto-show keyboard when the surface attaches.
-            LaunchedEffect(pane) {
-                surfaceRef.value?.showSoftKeyboard()
+                        view.alpha = if (isOwnedBySelf) 1f else 0f
+                        view.isFocusable = isOwnedBySelf
+                        view.isFocusableInTouchMode = isOwnedBySelf
+                    },
+                )
             }
 
-            if (!isOwnedBySelf && owner != null) {
+            // Suppress overlay only during the brief silent-takeover handshake:
+            // user-initiated mount, takeover RPC sent, but server hasn't yet
+            // confirmed us as owner. Once confirmed once, normal overlay rules
+            // apply — including showing it when the Mac steals back.
+            val suppressOverlay =
+                userInitiatedMount && autoTakenPaneID == paneID && !ownershipConfirmedOnce
+            if (!isOwnedBySelf && owner != null && !suppressOverlay) {
                 TakeOverOverlay(
                     ownerName = owner.displayName,
                     foreground = palette.foreground,
                     background = palette.background,
                     onTakeOver = {
                         val p = pane ?: return@TakeOverOverlay
-                        val c = measuredCols ?: return@TakeOverOverlay
-                        val r = measuredRows ?: return@TakeOverOverlay
-                        scope.launch { p.takeOver(c, r) }
+                        // Prefer the termux view's actual size; fall back to the
+                        // last reported value, then to a sane default. Without a
+                        // fallback the button is dead until layout reports.
+                        val view = termViewRef.value
+                        val emulator = view?.mEmulator
+                        val c = emulator?.mColumns?.takeIf { it > 0 } ?: measuredCols ?: 80
+                        val r = emulator?.mRows?.takeIf { it > 0 } ?: measuredRows ?: 24
+                        scope.launch {
+                            termSession.value?.resetEmulatorScreen()
+                            p.takeOver(c, r)
+                        }
                     },
                 )
             }
@@ -196,21 +246,100 @@ fun TerminalView(
             keyboardVisible = keyboardVisible,
             onSendBytes = { bytes -> pane?.sendBytes(bytes) },
             onPaste = {
-                pasteFromClipboardText(context)?.let { surfaceRef.value?.pasteText(it) }
+                pasteFromClipboardText(context)?.let { text ->
+                    val bytes = text.toByteArray(Charsets.UTF_8)
+                    termSession.value?.write(bytes, 0, bytes.size)
+                }
             },
-            onCopy = {
-                val v = surfaceRef.value ?: return@AccessoryBar
-                v.selectedText()?.let { copyToClipboard(context, it) }
-                v.clearSelection()
-            },
-            canCopy = canCopy,
+            onCopy = { /* termux view handles selection + copy through its own action mode */ },
+            canCopy = false,
             onToggleKeyboard = {
-                val v = surfaceRef.value ?: return@AccessoryBar
-                if (keyboardVisible) v.hideSoftKeyboard() else v.showSoftKeyboard()
+                val view = termViewRef.value ?: return@AccessoryBar
+                val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+                    ?: return@AccessoryBar
+                if (keyboardVisible) {
+                    imm.hideSoftInputFromWindow(view.windowToken, 0)
+                } else {
+                    view.isFocusable = true
+                    view.isFocusableInTouchMode = true
+                    view.requestFocus()
+                    view.post {
+                        imm.showSoftInput(view, InputMethodManager.SHOW_IMPLICIT)
+                    }
+                }
             },
         )
     }
 }
+
+/**
+ * Forwards the termux view's actual cols/rows back to Compose state and to
+ * [PaneSession.resize]. Re-attached from `update {}` on every recomposition so
+ * the first valid size is reported immediately (the OnLayoutChangeListener
+ * alone only fires on geometry changes — not when the emulator finally
+ * initializes after `attachSession`).
+ */
+private class SizeReporter {
+    private var lastCols = 0
+    private var lastRows = 0
+    private var attached: View? = null
+    private var callback: ((Int, Int) -> Unit)? = null
+    private val listener = View.OnLayoutChangeListener { v, _, _, _, _, _, _, _, _ ->
+        report(v as TermuxTerminalView)
+    }
+
+    fun attach(view: TermuxTerminalView, onSize: (Int, Int) -> Unit) {
+        callback = onSize
+        if (attached === view) {
+            report(view)
+            return
+        }
+        attached?.removeOnLayoutChangeListener(listener)
+        view.removeOnLayoutChangeListener(listener)
+        view.addOnLayoutChangeListener(listener)
+        attached = view
+        report(view)
+    }
+
+    private fun report(view: TermuxTerminalView) {
+        val emulator = view.mEmulator ?: return
+        val cols = emulator.mColumns
+        val rows = emulator.mRows
+        if (cols <= 0 || rows <= 0) return
+        if (cols == lastCols && rows == lastRows) return
+        lastCols = cols
+        lastRows = rows
+        callback?.invoke(cols, rows)
+    }
+}
+
+private fun applyTheme(
+    view: TermuxTerminalView,
+    fg: Long?,
+    bg: Long?,
+    palette: List<Long>?,
+) {
+    val emulator: TerminalEmulator = view.mEmulator ?: return
+    val fgInt = ((fg ?: 0xFFFFFFL).toInt() and 0xFFFFFF) or 0xFF000000.toInt()
+    val bgInt = ((bg ?: 0x000000L).toInt() and 0xFFFFFF) or 0xFF000000.toInt()
+    emulator.mColors.mCurrentColors[TextStyle.COLOR_INDEX_FOREGROUND] = fgInt
+    emulator.mColors.mCurrentColors[TextStyle.COLOR_INDEX_BACKGROUND] = bgInt
+    emulator.mColors.mCurrentColors[TextStyle.COLOR_INDEX_CURSOR] = fgInt
+    if (palette != null && palette.size >= 16) {
+        for (i in 0 until 16) {
+            emulator.mColors.mCurrentColors[i] = (palette[i].toInt() and 0xFFFFFF) or 0xFF000000.toInt()
+        }
+    }
+    view.setBackgroundColor(bgInt)
+    view.invalidate()
+}
+
+private fun spToPx(context: Context, sp: Int): Float =
+    sp * context.resources.displayMetrics.scaledDensity
+
+private fun resolveTypeface(context: Context): Typeface =
+    runCatching { Typeface.createFromAsset(context.assets, FONT_PATH) }
+        .getOrDefault(Typeface.MONOSPACE)
 
 @Composable
 private fun TakeOverOverlay(
@@ -254,8 +383,4 @@ private fun TakeOverOverlay(
             }
         }
     }
-}
-
-private class Ref<T> {
-    var value: T? = null
 }
