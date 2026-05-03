@@ -2,6 +2,38 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Top-level rules
+
+- Security first
+- Native only
+- Maintainability
+- Scalability
+- Clean code
+- Clean architecture
+- Best practices
+- No hacky solutions
+
+## Working rules
+
+- No comments in the codebase — code must be self-explanatory and cleanly structured.
+- Use early returns instead of nested conditionals.
+- Don't patch symptoms, fix root causes.
+- For every task, consider the impact on architecture and code quality, not just the immediate problem.
+- Follow existing patterns, but propose refactors when they improve quality or maintainability.
+- Use logs for debugging.
+- If a feature is testable, write tests for it.
+- Never answer without first investigating and exploring the codebase.
+
+## Pull requests
+
+- Keep PR descriptions to 3 lines maximum — they're for humans.
+- Attach screenshots or recordings.
+
+## Code review
+
+- Review against the stated purpose of the PR/issue. Unrelated issues found during review go in a separate section.
+- Apply review recommendations only after the user confirms.
+
 ## Repo layout
 
 Monorepo with two **completely separate** native mobile clients for the Muxy macOS server (which lives in `~/Projects/muxy`). There is **no shared code** between `ios/` and `android/` — the wire protocol is implemented twice (Swift in `ios/MuxyShared/`, Kotlin under `android/app/src/main/java/com/muxy/app/net/` and `model/`). When changing the protocol, both implementations must be updated in lockstep.
