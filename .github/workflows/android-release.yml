@@ -54,7 +54,7 @@ jobs:
           if [[ "$MAJOR" -ge 1 ]]; then
             TRACK="production"
           else
-            TRACK="4699868071015324797"
+            TRACK="alpha"
           fi
           echo "Resolved track: $TRACK (versionName=$VERSION_NAME)"
           echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
