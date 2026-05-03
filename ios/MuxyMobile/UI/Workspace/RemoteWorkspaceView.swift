@@ -1,4 +1,3 @@
-import MuxyShared
 import SwiftUI
 
 struct WorkspaceContentWrapper: View {
@@ -97,8 +96,9 @@ struct WorkspaceContentWrapper: View {
             ForEach(allTabs, id: \.tab.id) { entry in
                 Button {
                     Task {
+                        guard let projectID = connection.activeProjectID else { return }
                         await connection.selectTab(
-                            projectID: connection.activeProjectID!,
+                            projectID: projectID,
                             areaID: entry.area.id,
                             tabID: entry.tab.id
                         )
