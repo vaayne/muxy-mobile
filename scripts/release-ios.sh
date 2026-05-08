@@ -42,6 +42,7 @@ cd "$REPO_ROOT"
 APP_EXPORT_PATH="ios/build/export"
 
 if [[ "$UPLOAD_ONLY" == "true" ]]; then
+  run_started
   load_env
   require_file APP_STORE_CONNECT_API_KEY_PATH
   require_var APP_STORE_CONNECT_KEY_ID
@@ -54,8 +55,7 @@ if [[ "$UPLOAD_ONLY" == "true" ]]; then
   fi
   [[ -f "$IPA_PATH" ]] || die "IPA not found at $IPA_PATH"
 
-  log "Uploading existing IPA: $IPA_PATH"
-
+  step "Uploading existing IPA"
   mkdir -p "$HOME/.appstoreconnect/private_keys"
   cp "$APP_STORE_CONNECT_API_KEY_PATH" \
     "$HOME/.appstoreconnect/private_keys/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"
@@ -66,7 +66,13 @@ if [[ "$UPLOAD_ONLY" == "true" ]]; then
     --file "$IPA_PATH" \
     --apiKey "$APP_STORE_CONNECT_KEY_ID" \
     --apiIssuer "$APP_STORE_CONNECT_ISSUER_ID"
-  log "Upload complete"
+
+  IPA_SIZE=$(du -h "$IPA_PATH" | cut -f1 | tr -d '[:space:]')
+  print_summary "iOS Upload Summary" \
+    "Mode" "upload-only" \
+    "IPA" "$IPA_PATH" \
+    "Size" "$IPA_SIZE" \
+    "Destination" "App Store Connect"
   exit 0
 fi
 
@@ -107,11 +113,12 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+run_started
 
-log "Installing JS deps"
+step "Installing JS deps"
 npm ci
 
-log "Writing version $VERSION ($BUILD_NUMBER) into app.json"
+step "Writing version $VERSION ($BUILD_NUMBER) into app.json"
 cp "$REPO_ROOT/app.json" "$APP_JSON_BACKUP"
 node -e "
   const fs = require('fs');
@@ -122,13 +129,13 @@ node -e "
   fs.writeFileSync('app.json', JSON.stringify(cfg, null, 2) + '\n');
 "
 
-log "expo prebuild (iOS)"
+step "expo prebuild (iOS)"
 npx expo prebuild --platform ios --no-install --clean --non-interactive
 
-log "pod install"
+step "pod install"
 ( cd ios && pod install )
 
-log "Creating temporary build keychain"
+step "Creating temporary build keychain"
 cleanup
 security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
@@ -137,7 +144,7 @@ security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 USER_KEYCHAINS=$(security list-keychains -d user | sed -e 's/"//g')
 security list-keychains -d user -s "$KEYCHAIN_PATH" $USER_KEYCHAINS
 
-log "Importing distribution certificate"
+step "Importing distribution certificate"
 security import "$APPLE_DISTRIBUTION_CERTIFICATE_P12_PATH" \
   -k "$KEYCHAIN_PATH" \
   -P "$APPLE_DISTRIBUTION_CERTIFICATE_PASSWORD" \
@@ -146,7 +153,7 @@ security set-key-partition-list \
   -S apple-tool:,apple:,codesign: \
   -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
-log "Validating provisioning profile"
+step "Validating provisioning profile"
 PROFILE_PLIST="$(mktemp)"
 security cms -D -i "$APP_STORE_PROVISIONING_PROFILE_PATH" > "$PROFILE_PLIST"
 PROFILE_UUID=$(/usr/libexec/PlistBuddy -c "Print :UUID" "$PROFILE_PLIST")
@@ -166,7 +173,7 @@ cp "$APP_STORE_PROVISIONING_PROFILE_PATH" \
   "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
 rm -f "$PROFILE_PLIST"
 
-log "Archiving"
+step "Archiving"
 xcodebuild \
   -workspace "$APP_WORKSPACE" \
   -scheme "$APP_SCHEME" \
@@ -183,7 +190,7 @@ xcodebuild \
   OTHER_CODE_SIGN_FLAGS="--keychain $KEYCHAIN_PATH" \
   clean archive
 
-log "Exporting IPA"
+step "Exporting IPA"
 EXPORT_OPTIONS="$(mktemp -t ExportOptions).plist"
 cat > "$EXPORT_OPTIONS" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -222,9 +229,11 @@ IPA_PATH=$(ls "$APP_EXPORT_PATH"/*.ipa | head -1)
 [[ -f "$IPA_PATH" ]] || die "IPA not found in $APP_EXPORT_PATH"
 
 log "Built IPA: $IPA_PATH"
+IPA_SIZE=$(du -h "$IPA_PATH" | cut -f1 | tr -d '[:space:]')
+UPLOAD_STATUS="skipped"
 
 if [[ "$AUTO_UPLOAD" == "true" ]] || confirm "Upload to App Store Connect?"; then
-  log "Uploading to App Store Connect"
+  step "Uploading to App Store Connect"
   mkdir -p "$HOME/.appstoreconnect/private_keys"
   cp "$APP_STORE_CONNECT_API_KEY_PATH" \
     "$HOME/.appstoreconnect/private_keys/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"
@@ -234,7 +243,14 @@ if [[ "$AUTO_UPLOAD" == "true" ]] || confirm "Upload to App Store Connect?"; the
     --file "$IPA_PATH" \
     --apiKey "$APP_STORE_CONNECT_KEY_ID" \
     --apiIssuer "$APP_STORE_CONNECT_ISSUER_ID"
-  log "Upload complete"
+  UPLOAD_STATUS="App Store Connect"
 else
   log "Skipped upload. IPA stays at $IPA_PATH"
 fi
+
+print_summary "iOS Release Summary" \
+  "Version" "$VERSION ($BUILD_NUMBER)" \
+  "Bundle ID" "$BUNDLE_ID" \
+  "IPA" "$IPA_PATH" \
+  "Size" "$IPA_SIZE" \
+  "Upload" "$UPLOAD_STATUS"

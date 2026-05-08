@@ -44,6 +44,7 @@ PACKAGE_NAME="com.muxy.app"
 KEYSTORE_DEST="android/app/upload-keystore.jks"
 
 if [[ "$UPLOAD_ONLY" == "true" ]]; then
+  run_started
   load_env
   AAB_PATH="${1:-}"
   if [[ -z "$AAB_PATH" ]]; then
@@ -70,7 +71,7 @@ if [[ "$UPLOAD_ONLY" == "true" ]]; then
     TRACK="alpha"
   fi
 
-  log "Uploading existing AAB: $AAB_PATH"
+  step "Uploading existing AAB"
   log "  versionCode (from AAB): ${VERSION_CODE_FROM_AAB:-unknown}"
   log "  track: $TRACK"
 
@@ -86,7 +87,15 @@ if [[ "$UPLOAD_ONLY" == "true" ]]; then
     --package-name "$PACKAGE_NAME" \
     --track "$TRACK" \
     --json-key "$PLAY_SERVICE_ACCOUNT_JSON_PATH"
-  log "Upload complete"
+
+  AAB_SIZE=$(du -h "$AAB_PATH" | cut -f1 | tr -d '[:space:]')
+  print_summary "Android Upload Summary" \
+    "Mode" "upload-only" \
+    "Package" "$PACKAGE_NAME" \
+    "AAB" "$AAB_PATH" \
+    "versionCode" "${VERSION_CODE_FROM_AAB:-unknown}" \
+    "Size" "$AAB_SIZE" \
+    "Track" "$TRACK (draft)"
   exit 0
 fi
 
@@ -121,11 +130,12 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+run_started
 
-log "Installing JS deps"
+step "Installing JS deps"
 npm ci
 
-log "Writing version $VERSION_NAME ($VERSION_CODE) into app.json"
+step "Writing version $VERSION_NAME ($VERSION_CODE) into app.json"
 cp "$REPO_ROOT/app.json" "$APP_JSON_BACKUP"
 node -e "
   const fs = require('fs');
@@ -136,16 +146,16 @@ node -e "
   fs.writeFileSync('app.json', JSON.stringify(cfg, null, 2) + '\n');
 "
 
-log "expo prebuild (Android)"
+step "expo prebuild (Android)"
 npx expo prebuild --platform android --no-install --clean --non-interactive
 
-log "Copying keystore into android/app/"
+step "Copying keystore into android/app/"
 cp "$ANDROID_SIGNING_KEY_PATH" "$KEYSTORE_DEST"
 
-log "Patching android/app/build.gradle with release signing config"
+step "Patching android/app/build.gradle with release signing config"
 node "$SCRIPT_DIR/lib/patch_signing.js" android/app/build.gradle
 
-log "Building signed Release AAB"
+step "Building signed Release AAB"
 chmod +x android/gradlew
 ( cd android && \
     ANDROID_KEY_STORE_PASSWORD="$ANDROID_KEY_STORE_PASSWORD" \
@@ -157,6 +167,8 @@ AAB_PATH=$(ls android/app/build/outputs/bundle/release/*.aab | head -1)
 [[ -f "$AAB_PATH" ]] || die "AAB not found"
 
 log "Built AAB: $AAB_PATH (track: $TRACK)"
+AAB_SIZE=$(du -h "$AAB_PATH" | cut -f1 | tr -d '[:space:]')
+UPLOAD_STATUS="skipped"
 
 if [[ -n "${PLAY_SERVICE_ACCOUNT_JSON_PATH:-}" ]]; then
   if [[ "$PLAY_SERVICE_ACCOUNT_JSON_PATH" != /* ]]; then
@@ -165,7 +177,7 @@ if [[ -n "${PLAY_SERVICE_ACCOUNT_JSON_PATH:-}" ]]; then
 fi
 if [[ -n "${PLAY_SERVICE_ACCOUNT_JSON_PATH:-}" && -f "${PLAY_SERVICE_ACCOUNT_JSON_PATH:-}" ]]; then
   if [[ "$AUTO_UPLOAD" == "true" ]] || confirm "Upload AAB to Play Store ($TRACK track, draft status)?"; then
-    log "Uploading to Play Store"
+    step "Uploading to Play Store"
     VENV_DIR="$REPO_ROOT/.venv-play-upload"
     if [[ ! -d "$VENV_DIR" ]]; then
       log "Creating Python venv for Play upload (one-time)"
@@ -178,11 +190,18 @@ if [[ -n "${PLAY_SERVICE_ACCOUNT_JSON_PATH:-}" && -f "${PLAY_SERVICE_ACCOUNT_JSO
       --package-name "$PACKAGE_NAME" \
       --track "$TRACK" \
       --json-key "$PLAY_SERVICE_ACCOUNT_JSON_PATH"
-    log "Upload complete"
+    UPLOAD_STATUS="Play Store ($TRACK draft)"
   else
     log "Skipped upload. AAB stays at $AAB_PATH"
   fi
 else
   log "PLAY_SERVICE_ACCOUNT_JSON_PATH not set or file missing; skipping Play upload."
-  log "AAB stays at $AAB_PATH"
 fi
+
+print_summary "Android Release Summary" \
+  "Version" "$VERSION_NAME ($VERSION_CODE)" \
+  "Package" "$PACKAGE_NAME" \
+  "AAB" "$AAB_PATH" \
+  "Size" "$AAB_SIZE" \
+  "Track" "$TRACK" \
+  "Upload" "$UPLOAD_STATUS"
