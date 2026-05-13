@@ -1,5 +1,5 @@
 import { Stack, useLocalSearchParams, useRouter } from 'expo-router';
-import { useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   KeyboardAvoidingView,
@@ -24,6 +24,7 @@ import {
   type PairingPhase,
 } from '@/state';
 import { useTokens } from '@/theme';
+import { browseServices, isDiscoveryAvailable, type DiscoveredService } from '@/transport';
 
 type Phase = 'idle' | PairingPhase | 'success' | 'error';
 
@@ -32,7 +33,14 @@ const DEFAULT_PORT = '4865';
 export default function AddDeviceScreen() {
   const tokens = useTokens();
   const router = useRouter();
-  const params = useLocalSearchParams<{ entryId?: string; host?: string; port?: string; label?: string }>();
+  const params = useLocalSearchParams<{
+    entryId?: string;
+    host?: string;
+    port?: string;
+    label?: string;
+    service?: string;
+    auto?: string;
+  }>();
   const isRepair = Boolean(params.entryId);
 
   const ensureInstallDeviceID = useDevicesStore((s) => s.ensureInstallDeviceID);
@@ -46,12 +54,32 @@ export default function AddDeviceScreen() {
   const [label, setLabel] = useState(params.label ?? '');
   const [host, setHost] = useState(params.host ?? '');
   const [port, setPort] = useState(params.port ?? DEFAULT_PORT);
+  const [serviceName, setServiceName] = useState<string | undefined>(params.service);
   const [phase, setPhase] = useState<Phase>('idle');
   const [error, setError] = useState<string | null>(null);
+  const [nearby, setNearby] = useState<DiscoveredService[]>([]);
 
   const busy = phase === 'connecting' || phase === 'authenticating' || phase === 'awaiting-approval';
 
-  const onPair = async () => {
+  const discoveryAvailable = isDiscoveryAvailable();
+
+  useEffect(() => {
+    if (!discoveryAvailable) return;
+    const handle = browseServices(setNearby);
+    return () => handle.stop();
+  }, [discoveryAvailable]);
+
+  const onSelectNearby = (service: DiscoveredService) => {
+    if (busy) return;
+    setHost(service.host);
+    setPort(String(service.port));
+    setServiceName(service.name);
+    if (!label.trim()) setLabel(service.name);
+  };
+
+  const autoPairedRef = useRef(false);
+
+  const onPair = useCallback(async () => {
     setError(null);
     const trimmedHost = host.trim();
     const portNum = parseInt(port, 10);
@@ -78,13 +106,22 @@ export default function AddDeviceScreen() {
         onPhase: (p) => setPhase(p),
       });
 
-      const finalEntryId = isRepair && existingEntry ? existingEntry.id : result.entryId;
+      const allDevices = useDevicesStore.getState().devices;
+      const duplicate = isRepair
+        ? null
+        : (serviceName
+            ? allDevices.find((d) => d.serviceName && d.serviceName === serviceName)
+            : null) ??
+          allDevices.find((d) => d.host === trimmedHost && d.port === portNum);
+      const reusedEntry = isRepair ? existingEntry : duplicate;
+      const finalEntryId = reusedEntry?.id ?? result.entryId;
       const entry: DeviceEntry = {
         id: finalEntryId,
-        label: label.trim() || trimmedHost,
+        label: label.trim() || reusedEntry?.label || trimmedHost,
         host: trimmedHost,
         port: portNum,
-        pairedAt: existingEntry?.pairedAt ?? new Date().toISOString(),
+        serviceName: serviceName ?? reusedEntry?.serviceName,
+        pairedAt: reusedEntry?.pairedAt ?? new Date().toISOString(),
         pairing: result.pairing,
       };
 
@@ -97,7 +134,12 @@ export default function AddDeviceScreen() {
       }
 
       setPhase('success');
-      router.back();
+      if (params.auto === '1') {
+        if (router.canDismiss()) router.dismissAll();
+        router.push('/projects');
+      } else {
+        router.back();
+      }
     } catch (err) {
       const message =
         err instanceof PairingError
@@ -114,7 +156,28 @@ export default function AddDeviceScreen() {
       setPhase('error');
       setError(message);
     }
-  };
+  }, [
+    host,
+    port,
+    label,
+    serviceName,
+    isRepair,
+    existingEntry,
+    ensureInstallDeviceID,
+    upsertDevice,
+    setActiveDevice,
+    setNeedsRepair,
+    router,
+    params.auto,
+  ]);
+
+  useEffect(() => {
+    if (params.auto !== '1' || isRepair) return;
+    if (autoPairedRef.current) return;
+    if (!host.trim() || !port.trim()) return;
+    autoPairedRef.current = true;
+    void onPair();
+  }, [params.auto, isRepair, host, port, onPair]);
 
   const phaseHint = (() => {
     switch (phase) {
@@ -141,9 +204,27 @@ export default function AddDeviceScreen() {
           headerLeft: () => (
             <HeaderIconButton icon="close" accessibilityLabel="Close" onPress={() => router.back()} />
           ),
+          headerRight: isRepair
+            ? undefined
+            : () => (
+                <HeaderIconButton
+                  icon="qr-code-outline"
+                  accessibilityLabel="Scan pairing QR code"
+                  onPress={() => router.push('/scan-pair')}
+                />
+              ),
         }}
       />
       <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
+        {discoveryAvailable ? (
+          <NearbyList
+            services={nearby}
+            selectedName={serviceName}
+            disabled={busy}
+            onSelect={onSelectNearby}
+          />
+        ) : null}
+
         <View
           style={[styles.card, { backgroundColor: tokens.surface.secondary, borderColor: tokens.border.subtle }]}>
           <Field
@@ -159,7 +240,10 @@ export default function AddDeviceScreen() {
           <Field
             label="Host"
             value={host}
-            onChangeText={setHost}
+            onChangeText={(v) => {
+              setHost(v);
+              setServiceName(undefined);
+            }}
             placeholder="192.168.1.10 or your-host.local"
             editable={!busy}
             autoCapitalize="none"
@@ -170,7 +254,10 @@ export default function AddDeviceScreen() {
           <Field
             label="Port"
             value={port}
-            onChangeText={setPort}
+            onChangeText={(v) => {
+              setPort(v);
+              setServiceName(undefined);
+            }}
             placeholder={DEFAULT_PORT}
             editable={!busy}
             autoCapitalize="none"
@@ -236,6 +323,75 @@ function Divider() {
   return <View style={[styles.divider, { backgroundColor: tokens.border.subtle }]} />;
 }
 
+function NearbyList({
+  services,
+  selectedName,
+  disabled,
+  onSelect,
+}: {
+  services: DiscoveredService[];
+  selectedName: string | undefined;
+  disabled: boolean;
+  onSelect: (service: DiscoveredService) => void;
+}) {
+  const tokens = useTokens();
+
+  return (
+    <View style={styles.nearbySection}>
+      <Text style={[styles.sectionLabel, { color: tokens.text.muted }]}>Nearby Muxy desktops</Text>
+      <View
+        style={[
+          styles.card,
+          { backgroundColor: tokens.surface.secondary, borderColor: tokens.border.subtle },
+        ]}>
+        {services.length === 0 ? (
+          <View style={styles.nearbyEmpty}>
+            <ActivityIndicator color={tokens.accent.primary} />
+            <Text style={[styles.nearbyEmptyText, { color: tokens.text.muted }]}>
+              Searching the local network…
+            </Text>
+          </View>
+        ) : (
+          services.map((service, idx) => {
+            const selected = service.name === selectedName;
+            return (
+              <View key={service.name}>
+                {idx > 0 ? <Divider /> : null}
+                <Pressable
+                  accessibilityRole="button"
+                  disabled={disabled}
+                  onPress={() => onSelect(service)}
+                  style={({ pressed }) => [
+                    styles.nearbyRow,
+                    {
+                      backgroundColor: selected
+                        ? tokens.accent.primary + '22'
+                        : pressed
+                          ? tokens.surface.primary
+                          : 'transparent',
+                    },
+                  ]}>
+                  <View style={styles.nearbyRowText}>
+                    <Text style={[styles.nearbyRowName, { color: tokens.text.primary }]}>
+                      {service.name}
+                    </Text>
+                    <Text style={[styles.nearbyRowAddr, { color: tokens.text.muted }]}>
+                      {service.host}:{service.port}
+                    </Text>
+                  </View>
+                  {selected ? (
+                    <Text style={[styles.nearbyRowCheck, { color: tokens.accent.primary }]}>✓</Text>
+                  ) : null}
+                </Pressable>
+              </View>
+            );
+          })
+        )}
+      </View>
+    </View>
+  );
+}
+
 const styles = StyleSheet.create({
   root: { flex: 1 },
   content: { padding: 16, gap: 12 },
@@ -276,4 +432,31 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     marginTop: 8,
   },
+  nearbySection: { gap: 6 },
+  sectionLabel: {
+    fontSize: 12,
+    fontWeight: '500',
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+    paddingHorizontal: 4,
+  },
+  nearbyEmpty: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+  },
+  nearbyEmptyText: { fontSize: 14 },
+  nearbyRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    gap: 12,
+  },
+  nearbyRowText: { flex: 1, gap: 2 },
+  nearbyRowName: { fontSize: 16, fontWeight: '500' },
+  nearbyRowAddr: { fontSize: 13 },
+  nearbyRowCheck: { fontSize: 18, fontWeight: '600' },
 });
