@@ -9,6 +9,7 @@ export type IapPurchase = {
   purchaseState: 'pending' | 'purchased' | 'unknown';
   purchaseToken: string | null;
   transactionId: string | null;
+  isAcknowledgedAndroid: boolean;
 };
 export type IapError = { message: string };
 
@@ -19,9 +20,7 @@ export const IAP_AVAILABLE =
   Constants.executionEnvironment !== ExecutionEnvironment.StoreClient;
 
 type IapModule = typeof import('react-native-iap');
-type NativePurchase = Parameters<
-  Parameters<IapModule['purchaseUpdatedListener']>[0]
->[0];
+type NativePurchase = import('react-native-iap').Purchase;
 
 let modulePromise: Promise<IapModule | null> | null = null;
 
@@ -34,11 +33,20 @@ async function loadModule(): Promise<IapModule | null> {
 }
 
 function toIapPurchase(p: NativePurchase): IapPurchase {
+  const androidState = p.purchaseStateAndroid;
+  let state: IapPurchase['purchaseState'] = 'unknown';
+  if (Platform.OS === 'android') {
+    if (androidState === 1) state = 'purchased';
+    else if (androidState === 2) state = 'pending';
+  } else {
+    state = 'purchased';
+  }
   return {
     productId: p.productId,
-    purchaseState: p.purchaseState,
+    purchaseState: state,
     purchaseToken: p.purchaseToken ?? null,
-    transactionId: p.id ?? null,
+    transactionId: p.transactionId ?? null,
+    isAcknowledgedAndroid: Boolean(p.isAcknowledgedAndroid),
   };
 }
 
@@ -51,43 +59,43 @@ export async function connect(): Promise<void> {
 export async function fetchUnlockProduct(): Promise<IapProduct | null> {
   const m = await loadModule();
   if (!m) return null;
-  const result = await m.fetchProducts({ skus: [PRODUCT_ID], type: 'in-app' });
-  if (!result || !Array.isArray(result)) return null;
-  const match = result.find((p) => p?.id === PRODUCT_ID);
-  if (!match || !('displayPrice' in match)) return null;
-  return { id: match.id, displayPrice: match.displayPrice };
+  const products = await m.getProducts({ skus: [PRODUCT_ID] });
+  const match = products.find((p) => p.productId === PRODUCT_ID);
+  if (!match) return null;
+  return { id: match.productId, displayPrice: match.localizedPrice };
 }
 
 export async function queryUnlockPurchases(): Promise<IapPurchase[]> {
   const m = await loadModule();
   if (!m) return [];
-  const purchases = await m.getAvailablePurchases({ onlyIncludeActiveItemsIOS: true });
-  return purchases
-    .filter((p) => p.productId === PRODUCT_ID)
-    .map(toIapPurchase);
+  const purchases = await m.getAvailablePurchases({ onlyIncludeActiveItems: true });
+  return purchases.filter((p) => p.productId === PRODUCT_ID).map(toIapPurchase);
 }
 
 export async function buyUnlock(): Promise<void> {
   const m = await loadModule();
   if (!m) throw new Error('In-app purchases are not available in this build.');
-  await m.requestPurchase({
-    type: 'in-app',
-    request:
-      Platform.OS === 'ios'
-        ? { ios: { sku: PRODUCT_ID } }
-        : { android: { skus: [PRODUCT_ID] } },
-  });
+  if (Platform.OS === 'ios') {
+    await m.requestPurchase({ sku: PRODUCT_ID });
+    return;
+  }
+  await m.requestPurchase({ skus: [PRODUCT_ID] });
 }
 
 export async function finalizePurchase(purchase: IapPurchase): Promise<void> {
   const m = await loadModule();
   if (!m) return;
-  if (Platform.OS === 'android' && !purchase.purchaseToken) return;
+  if (Platform.OS === 'android') {
+    if (!purchase.purchaseToken) return;
+    if (purchase.isAcknowledgedAndroid) return;
+  }
   if (Platform.OS === 'ios' && !purchase.transactionId) return;
   const native = {
-    id: purchase.transactionId ?? '',
     productId: purchase.productId,
+    transactionId: purchase.transactionId ?? undefined,
     purchaseToken: purchase.purchaseToken ?? undefined,
+    purchaseStateAndroid: purchase.purchaseState === 'purchased' ? 1 : undefined,
+    isAcknowledgedAndroid: purchase.isAcknowledgedAndroid,
   } as never;
   await m.finishTransaction({ purchase: native, isConsumable: false });
 }
