@@ -2,15 +2,18 @@ import { Ionicons } from '@expo/vector-icons';
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react';
 import { type LayoutChangeEvent, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 
+import type { TabWithArea } from '@/state';
 import { useTokens } from '@/theme';
-import type { Tab, TabKind } from '@/transport';
+import type { TabKind } from '@/transport';
 
 type Props = {
-  tabs: Tab[];
+  tabs: TabWithArea[];
   activeTabId: string | undefined;
   onSelect: (tabId: string) => void;
   onCreateTerminal: () => void;
+  onCloseTab: (areaId: string, tabId: string) => void;
   creatingTerminal?: boolean;
+  closingTabId?: string | null;
 };
 
 export type WorkspaceTabStripHandle = {
@@ -18,7 +21,15 @@ export type WorkspaceTabStripHandle = {
 };
 
 export const WorkspaceTabStrip = forwardRef<WorkspaceTabStripHandle, Props>(function WorkspaceTabStrip(
-  { tabs, activeTabId, onSelect, onCreateTerminal, creatingTerminal = false },
+  {
+    tabs,
+    activeTabId,
+    onSelect,
+    onCreateTerminal,
+    onCloseTab,
+    creatingTerminal = false,
+    closingTabId = null,
+  },
   ref,
 ) {
   const tokens = useTokens();
@@ -42,7 +53,7 @@ export const WorkspaceTabStrip = forwardRef<WorkspaceTabStripHandle, Props>(func
         const currentTabs = tabsRef.current;
         const nearest = Math.max(0, Math.min(currentTabs.length - 1, Math.round(fractionalIndex)));
         const nearestTab = currentTabs[nearest];
-        setPreviewTabId(nearestTab ? nearestTab.id : null);
+        setPreviewTabId(nearestTab ? nearestTab.tab.id : null);
 
         const vw = viewportWidthRef.current;
         if (vw === 0) return;
@@ -50,13 +61,13 @@ export const WorkspaceTabStrip = forwardRef<WorkspaceTabStripHandle, Props>(func
         const hi = Math.ceil(fractionalIndex);
         const loTab = currentTabs[lo];
         if (!loTab) return;
-        const loLayout = tabLayoutsRef.current[loTab.id];
+        const loLayout = tabLayoutsRef.current[loTab.tab.id];
         if (!loLayout) return;
         const loCenter = loLayout.x + loLayout.width / 2;
         let center = loCenter;
         const hiTab = currentTabs[hi];
         if (hiTab && hi !== lo) {
-          const hiLayout = tabLayoutsRef.current[hiTab.id];
+          const hiLayout = tabLayoutsRef.current[hiTab.tab.id];
           if (hiLayout) {
             const hiCenter = hiLayout.x + hiLayout.width / 2;
             const t = fractionalIndex - lo;
@@ -85,20 +96,21 @@ export const WorkspaceTabStrip = forwardRef<WorkspaceTabStripHandle, Props>(func
           viewportWidthRef.current = e.nativeEvent.layout.width;
         }}
         contentContainerStyle={styles.row}>
-        {tabs.map((tab) => {
+        {tabs.map(({ tab, areaId }) => {
           const active = tab.id === visiblyActiveId;
+          const closing = tab.id === closingTabId;
           return (
             <Pressable
               key={tab.id}
               onPress={() => onSelect(tab.id)}
-              disabled={tab.id === activeTabId}
+              disabled={closing}
               onLayout={(e) => onTabLayout(tab.id, e)}
               style={({ pressed }) => [
                 styles.tab,
                 {
                   backgroundColor: active ? tokens.surface.tertiary : 'transparent',
                   borderColor: active ? tokens.accent.primary : tokens.border.subtle,
-                  opacity: pressed ? 0.85 : 1,
+                  opacity: closing ? 0.4 : pressed ? 0.85 : 1,
                 },
               ]}>
               <Ionicons
@@ -117,6 +129,15 @@ export const WorkspaceTabStrip = forwardRef<WorkspaceTabStripHandle, Props>(func
               {tab.isPinned ? (
                 <Ionicons name="pin" size={12} color={tokens.text.muted} />
               ) : null}
+              <Pressable
+                onPress={() => onCloseTab(areaId, tab.id)}
+                disabled={closing}
+                hitSlop={8}
+                accessibilityRole="button"
+                accessibilityLabel="Close tab"
+                style={({ pressed }) => [styles.closeBadge, { opacity: pressed ? 0.5 : 0.7 }]}>
+                <Ionicons name="close" size={14} color={tokens.text.muted} />
+              </Pressable>
             </Pressable>
           );
         })}
@@ -197,5 +218,13 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: '500',
     flexShrink: 1,
+  },
+  closeBadge: {
+    width: 18,
+    height: 18,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 9,
+    marginRight: -4,
   },
 });
