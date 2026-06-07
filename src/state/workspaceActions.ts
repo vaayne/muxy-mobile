@@ -1,6 +1,6 @@
 import type { MethodMap, MethodParams, MethodResult, Tab, Workspace } from '@/transport';
 
-type WorkspaceActionMethod = 'createTab' | 'getWorkspace';
+type WorkspaceActionMethod = 'createTab' | 'closeTab' | 'getWorkspace';
 export type WorkspaceActionRequest = <M extends WorkspaceActionMethod>(
   method: M,
   params: MethodParams<M>,
@@ -34,4 +34,30 @@ export async function createTerminalTab({
   setWorkspace(next.value);
 
   return created.value;
+}
+
+type CloseTerminalTabInput = {
+  projectId: string;
+  areaId: string;
+  tabId: string;
+  setWorkspace: (workspace: Workspace) => void;
+  request: WorkspaceActionRequest;
+};
+
+export async function closeTerminalTab({
+  projectId,
+  areaId,
+  tabId,
+  setWorkspace,
+  request,
+}: CloseTerminalTabInput): Promise<void> {
+  await request('closeTab', {
+    type: 'closeTab',
+    value: { projectID: projectId, areaID: areaId, tabID: tabId },
+  });
+  const next = await request('getWorkspace', {
+    type: 'getWorkspace',
+    value: { projectID: projectId },
+  });
+  setWorkspace(next.value);
 }
