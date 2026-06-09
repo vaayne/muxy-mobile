@@ -45,6 +45,7 @@ export function ProjectRow({ project, onPress }: Props) {
 
 const styles = StyleSheet.create({
   row: {
+    width: '100%',
     flexDirection: 'row',
     alignItems: 'center',
     gap: 12,
