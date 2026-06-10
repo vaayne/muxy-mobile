@@ -6,7 +6,7 @@ actor WebSocketTransport: Transport {
     private let session: URLSession
     private var task: URLSessionWebSocketTask?
 
-    init(url: URL, session: URLSession = URLSession(configuration: WebSocketTransport.defaultConfiguration())) {
+    init(url: URL, session: URLSession = URLSession(configuration: .default)) {
         self.url = url
         self.session = session
     }
@@ -16,7 +16,6 @@ actor WebSocketTransport: Transport {
         self.task = task
         task.resume()
         Log.transport.debug("WebSocket connecting to \(self.url.absoluteString, privacy: .public)")
-        try await waitUntilOpen(task)
     }
 
     func send(_ text: String) async throws {
@@ -54,23 +53,5 @@ actor WebSocketTransport: Transport {
         task?.cancel(with: .goingAway, reason: nil)
         task = nil
         Log.transport.debug("WebSocket closed")
-    }
-
-    private func waitUntilOpen(_ task: URLSessionWebSocketTask) async throws {
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-            task.sendPing { error in
-                if let error {
-                    continuation.resume(throwing: error)
-                    return
-                }
-                continuation.resume()
-            }
-        }
-    }
-
-    private static func defaultConfiguration() -> URLSessionConfiguration {
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.timeoutIntervalForRequest = 8
-        return configuration
     }
 }
