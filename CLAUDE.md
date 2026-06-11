@@ -54,6 +54,7 @@ Companion app for Muxy (github.com/muxy-app/muxy)
 - Prioritize problem comprehension over premature implementation. Validate the approach before execution to avoid rework
 - Plan properly in the plan mode before executing to not double work
 - After each task make sure the app builds. then before writing tests, ask user to visually test and if confirmed, then write tests.
+- Never run the app in dev mode. User will always run
 
 ## Code Review
 
